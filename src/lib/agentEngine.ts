@@ -51,6 +51,64 @@ export async function createAgentSession(userId: string): Promise<string | null>
   return typeof sessionId === "string" ? sessionId : null;
 }
 
+/**
+ * Trae la sesión completa (con todos sus eventos) tal como la ve el agente.
+ * La necesitamos porque Memory Bank no guarda "el último mensaje", sino la
+ * sesión entera: es ella la que se le pasa a `add_session_to_memory`.
+ */
+export async function getAgentSession(
+  userId: string,
+  sessionId: string
+): Promise<Record<string, unknown> | null> {
+  const { fullResourceName, location } = getAgentEngineConfig();
+
+  const res = await authorizedFetch(`${baseUrl(location)}/${fullResourceName}:query`, {
+    class_method: "async_get_session",
+    input: { user_id: userId, session_id: sessionId },
+  });
+
+  if (!res.ok) return null;
+
+  const data = await res.json().catch(() => null);
+  const output = data?.output ?? null;
+  return output && typeof output === "object" ? (output as Record<string, unknown>) : null;
+}
+
+/**
+ * Guarda una sesión en Memory Bank. Esto es lo que dispara la generación de
+ * memorias de largo plazo (Vertex AI lee la sesión y extrae hechos relevantes).
+ *
+ * Importante: ningún componente de ADK / Agent Engine hace esto solo. Si no
+ * llamamos a esto explícitamente, la conversación se pierde al cerrar la
+ * sesión, sin importar que Memory Bank esté "habilitado" en el agente.
+ */
+export async function addSessionToMemory(session: Record<string, unknown>): Promise<void> {
+  const { fullResourceName, location } = getAgentEngineConfig();
+
+  const res = await authorizedFetch(`${baseUrl(location)}/${fullResourceName}:query`, {
+    class_method: "async_add_session_to_memory",
+    input: { session },
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new AgentEngineError(
+      res.status,
+      text || `No se pudo guardar la sesión en memoria (status ${res.status}).`
+    );
+  }
+}
+
+/**
+ * Atajo: trae la sesión y la guarda en Memory Bank en un solo paso.
+ * Si la sesión no existe (todavía) simplemente no hace nada.
+ */
+export async function saveSessionToMemory(userId: string, sessionId: string): Promise<void> {
+  const session = await getAgentSession(userId, sessionId);
+  if (!session) return;
+  await addSessionToMemory(session);
+}
+
 export interface StreamQueryParams {
   userId: string;
   sessionId?: string | null;

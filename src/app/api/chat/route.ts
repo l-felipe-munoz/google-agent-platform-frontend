@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { AgentEngineError, streamAgentQuery } from "@/lib/agentEngine";
+import { AgentEngineError, saveSessionToMemory, streamAgentQuery } from "@/lib/agentEngine";
 import { EnvConfigError } from "@/lib/env";
 import { GoogleAuthConfigError } from "@/lib/googleAuth";
 import type { ChatRequestBody } from "@/types/chat";
@@ -7,6 +7,15 @@ import type { ChatRequestBody } from "@/types/chat";
 export const runtime = "nodejs";
 
 const MAX_MESSAGE_LENGTH = 8000;
+
+/** Lee un stream hasta el final sin hacer nada con su contenido. */
+async function drain(stream: ReadableStream<Uint8Array>): Promise<void> {
+  const reader = stream.getReader();
+  for (;;) {
+    const { done } = await reader.read();
+    if (done) return;
+  }
+}
 
 export async function POST(req: NextRequest) {
   let body: Partial<ChatRequestBody>;
@@ -33,13 +42,37 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const upstream = await streamAgentQuery({
-      userId,
-      sessionId: body.sessionId ?? null,
-      message,
-    });
+    const sessionId = body.sessionId ?? null;
+    const upstream = await streamAgentQuery({ userId, sessionId, message });
 
-    return new Response(upstream, {
+    // Sin sessionId no hay nada que guardar en Memory Bank (no sabríamos qué
+    // sesión pedirle al agente), así que devolvemos el stream tal cual.
+    if (!sessionId) {
+      return new Response(upstream, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+        },
+      });
+    }
+
+    // Partimos el stream en dos: una copia va al navegador tal cual, la otra
+    // solo la usamos para saber cuándo terminó la respuesta del agente.
+    const [clientStream, mirrorStream] = upstream.tee();
+
+    // Guardado en memoria "fire-and-forget": no bloqueamos la respuesta al
+    // navegador por esto. Si falla, solo lo dejamos en el log del servidor;
+    // el usuario ya tiene su respuesta y puede seguir chateando.
+    drain(mirrorStream)
+      .then(() => saveSessionToMemory(userId, sessionId))
+      .catch((err) => {
+        console.error("[memory] no se pudo guardar la sesión en Memory Bank:", err);
+      });
+
+    return new Response(clientStream, {
       status: 200,
       headers: {
         "Content-Type": "text/event-stream; charset=utf-8",
